@@ -18,6 +18,13 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 
+# Playwright 관련 import (선택적)
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 class WebCrawlerApp:
     def __init__(self, root):
         self.root = root
@@ -67,7 +74,13 @@ class WebCrawlerApp:
         # 브라우저 모드
         ttk.Label(advanced_frame, text="브라우저 모드:").grid(row=0, column=0, sticky=tk.W)
         self.browser_mode = tk.StringVar(value="requests")
-        browser_combo = ttk.Combobox(advanced_frame, textvariable=self.browser_mode, values=["requests", "selenium"], width=10)
+        
+        # 사용 가능한 브라우저 모드 리스트
+        browser_modes = ["requests", "selenium"]
+        if PLAYWRIGHT_AVAILABLE:
+            browser_modes.append("playwright")
+        
+        browser_combo = ttk.Combobox(advanced_frame, textvariable=self.browser_mode, values=browser_modes, width=12)
         browser_combo.grid(row=0, column=1, sticky=tk.W, padx=(5, 10))
         
         # 페이지 수
@@ -202,6 +215,9 @@ class WebCrawlerApp:
         self.is_crawling = False
         self.crawled_data = []
         self.driver = None
+        self.playwright = None
+        self.browser = None
+        self.page = None
         self.current_page = 1
         self.retry_count = 0
         self.max_retries = 3
@@ -249,12 +265,36 @@ class WebCrawlerApp:
         """크롤링을 중지합니다."""
         self.is_crawling = False
         self.status_var.set("크롤링 중지됨")
+        
+        # Selenium 드라이버 정리
         if self.driver:
             try:
                 self.driver.quit()
             except:
                 pass
             self.driver = None
+        
+        # Playwright 정리
+        if self.page:
+            try:
+                self.page.close()
+            except:
+                pass
+            self.page = None
+        
+        if self.browser:
+            try:
+                self.browser.close()
+            except:
+                pass
+            self.browser = None
+        
+        if self.playwright:
+            try:
+                self.playwright.stop()
+            except:
+                pass
+            self.playwright = None
     
     def start_crawling(self):
         """백그라운드에서 크롤링을 시작합니다."""
@@ -284,6 +324,8 @@ class WebCrawlerApp:
         # 백그라운드 스레드에서 크롤링 실행
         if self.browser_mode.get() == "selenium":
             thread = threading.Thread(target=self.crawl_with_selenium, args=(url,))
+        elif self.browser_mode.get() == "playwright":
+            thread = threading.Thread(target=self.crawl_with_playwright, args=(url,))
         else:
             thread = threading.Thread(target=self.crawl_website, args=(url,))
         thread.daemon = True
@@ -382,10 +424,29 @@ class WebCrawlerApp:
 • 강력한 봇 차단 시스템
 
 크롤링 방법:
-→ Playwright + 고급 기법
+→ Playwright + 고급 기법 (권장)
 → 헤드리스 브라우저 + 프록시 로테이션
 → API 리버스 엔지니어링
 → 예: Netflix, Instagram, LinkedIn
+
+🚀 브라우저 자동화 도구 비교
+
+📊 Requests vs Selenium vs Playwright
+┌─────────────┬────────────┬────────────┬──────────────┐
+│   도구      │   속도     │   안정성   │   호환성     │
+├─────────────┼────────────┼────────────┼──────────────┤
+│ Requests    │ 매우 빠름  │ 높음       │ 정적 사이트  │
+│ Selenium    │ 느림       │ 보통       │ 대부분 사이트│
+│ Playwright  │ 빠름       │ 매우 높음  │ 모든 사이트  │
+└─────────────┴────────────┴────────────┴──────────────┘
+
+🎯 Playwright 장점:
+• Selenium보다 2-3배 빠름
+• 안정적인 요소 대기 및 선택
+• 네트워크 인터셉션 지원
+• 여러 브라우저 엔진 지원 (Chromium, Firefox, WebKit)
+• 스크린샷 및 비디오 녹화 기능
+• 향상된 디버깅 도구
 
 🛠️ 기술스택별 상세 분석
 
@@ -888,6 +949,46 @@ class WebCrawlerApp:
             self.root.after(0, self.show_error, f"Selenium 설정 오류: {str(e)}")
             return False
     
+    def setup_playwright_browser(self):
+        """Playwright 브라우저를 설정합니다."""
+        try:
+            if not PLAYWRIGHT_AVAILABLE:
+                self.root.after(0, self.show_error, "Playwright가 설치되지 않았습니다. pip install playwright 후 playwright install을 실행하세요.")
+                return False
+            
+            self.playwright = sync_playwright().start()
+            
+            # 브라우저 선택 (Chromium 기본)
+            self.browser = self.playwright.chromium.launch(
+                headless=True,  # 백그라운드 실행
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled'
+                ]
+            )
+            
+            # 컨텍스트 생성 (시크릿 모드와 유사)
+            context = self.browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080}
+            )
+            
+            # 페이지 생성
+            self.page = context.new_page()
+            
+            # 자동화 감지 방지
+            self.page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                });
+            """)
+            
+            return True
+        except Exception as e:
+            self.root.after(0, self.show_error, f"Playwright 설정 오류: {str(e)}")
+            return False
+    
     def crawl_with_selenium(self, url):
         """Selenium을 사용한 크롤링을 수행합니다."""
         if not self.setup_selenium_driver():
@@ -1133,6 +1234,235 @@ class WebCrawlerApp:
         self.export_button.config(state='normal')
         self.is_crawling = False
         self.status_var.set(f"크롤링 완료 - 총 {len(self.crawled_data)}개 데이터 수집")
+
+    def crawl_with_playwright(self, url):
+        """Playwright를 사용한 크롤링을 수행합니다."""
+        try:
+            if not self.setup_playwright_browser():
+                return
+            
+            max_pages = int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1
+            delay = float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1
+            
+            for page in range(1, max_pages + 1):
+                if not self.is_crawling:
+                    break
+                
+                self.current_page = page
+                self.root.after(0, lambda p=page: self.status_var.set(f"페이지 {p}/{max_pages} Playwright 크롤링 중..."))
+                
+                page_url = self.generate_page_url(url, page)
+                
+                success = False
+                for retry in range(self.max_retries):
+                    try:
+                        # 페이지 로드
+                        self.page.goto(page_url, wait_until='domcontentloaded', timeout=30000)
+                        
+                        # 네트워크 요청 완료까지 대기
+                        self.page.wait_for_load_state('networkidle', timeout=10000)
+                        
+                        # 추가 대기 (JavaScript 실행 완료)
+                        self.page.wait_for_timeout(2000)
+                        
+                        # 사이트별 특화 크롤링
+                        domain = urlparse(page_url).netloc.lower()
+                        if 'shopping.naver.com' in domain:
+                            self.crawl_naver_shopping_playwright()
+                        elif 'instagram.com' in domain:
+                            self.crawl_instagram_playwright()
+                        elif any(keyword in domain for keyword in ['zigbang', 'dabang', '부동산']):
+                            self.crawl_real_estate_playwright()
+                        else:
+                            self.crawl_general_playwright()
+                        
+                        success = True
+                        break
+                        
+                    except Exception as e:
+                        self.root.after(0, lambda r=retry+1, err=str(e): self.status_var.set(f"Playwright 오류, 재시도 {r}/{self.max_retries}: {err[:30]}"))
+                        time.sleep(2)
+                
+                if not success:
+                    self.root.after(0, lambda p=page: self.status_var.set(f"페이지 {p} Playwright 크롤링 실패"))
+                
+                if page < max_pages and self.is_crawling:
+                    time.sleep(delay)
+            
+            self.root.after(0, self.finalize_crawling)
+            
+        except Exception as e:
+            self.root.after(0, self.show_error, f"Playwright 크롤링 오류: {str(e)}")
+        finally:
+            # Playwright 정리
+            if self.page:
+                try:
+                    self.page.close()
+                except:
+                    pass
+                self.page = None
+            
+            if self.browser:
+                try:
+                    self.browser.close()
+                except:
+                    pass
+                self.browser = None
+            
+            if self.playwright:
+                try:
+                    self.playwright.stop()
+                except:
+                    pass
+                self.playwright = None
+    
+    def crawl_general_playwright(self):
+        """일반적인 Playwright 크롤링"""
+        try:
+            # 페이지 소스 가져오기
+            content = self.page.content()
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # 기존 populate_table 메서드 활용
+            self.root.after(0, self.populate_table, self.page.url, soup)
+            
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): self.status_var.set(f"일반 Playwright 크롤링 오류: {err[:50]}"))
+    
+    def crawl_naver_shopping_playwright(self):
+        """네이버 쇼핑 Playwright 크롤링"""
+        try:
+            # 상품 목록 대기
+            self.page.wait_for_selector('.basicList_list_basis__uNBZx, .product_list, .goods_list', timeout=10000)
+            
+            # 상품 요소들 가져오기
+            products = self.page.query_selector_all('.basicList_item__FxDgW, .product_item, .goods_item')
+            
+            for i, product in enumerate(products[:20]):  # 최대 20개
+                if not self.is_crawling:
+                    break
+                
+                try:
+                    data = {'type': '네이버쇼핑'}
+                    
+                    # 상품명
+                    if self.extract_title.get():
+                        title_elem = product.query_selector('.basicList_title__3P9Q7, .product_title, .goods_name')
+                        if title_elem:
+                            data['title'] = title_elem.text_content().strip()
+                        else:
+                            data['title'] = f"상품 {i+1}"
+                    
+                    # 가격
+                    if self.extract_price.get():
+                        price_elem = product.query_selector('.price_num__2WUXn, .product_price, .price')
+                        if price_elem:
+                            data['price'] = price_elem.text_content().strip()
+                    
+                    # 상품 링크
+                    link_elem = product.query_selector('a')
+                    if link_elem:
+                        data['url'] = link_elem.get_attribute('href')
+                        if data['url'] and not data['url'].startswith('http'):
+                            data['url'] = 'https://shopping.naver.com' + data['url']
+                    else:
+                        data['url'] = self.page.url
+                    
+                    # 설명
+                    data['description'] = f"네이버 쇼핑 상품 (페이지 {self.current_page})"
+                    
+                    self.crawled_data.append(data)
+                    self.root.after(0, self.add_to_table, data)
+                    
+                except Exception:
+                    continue
+                    
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): self.status_var.set(f"네이버 쇼핑 Playwright 크롤링 오류: {err[:50]}"))
+    
+    def crawl_instagram_playwright(self):
+        """인스타그램 Playwright 크롤링"""
+        try:
+            # 게시물 요소들 대기
+            self.page.wait_for_selector('article, ._aagu', timeout=10000)
+            
+            posts = self.page.query_selector_all('article, ._aagu')
+            
+            for i, post in enumerate(posts[:10]):  # 최대 10개
+                if not self.is_crawling:
+                    break
+                
+                try:
+                    data = {'type': '인스타그램'}
+                    data['title'] = f"Instagram Post {i+1}"
+                    data['url'] = self.page.url
+                    data['description'] = f"인스타그램 게시물 (페이지 {self.current_page})"
+                    
+                    # 이미지 URL 추출
+                    if self.extract_images.get():
+                        img_elem = post.query_selector('img')
+                        if img_elem:
+                            data['image_url'] = img_elem.get_attribute('src')
+                    
+                    self.crawled_data.append(data)
+                    self.root.after(0, self.add_to_table, data)
+                    
+                except Exception:
+                    continue
+                    
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): self.status_var.set(f"인스타그램 Playwright 크롤링 오류: {err[:50]}"))
+    
+    def crawl_real_estate_playwright(self):
+        """부동산 사이트 Playwright 크롤링"""
+        try:
+            # 매물 목록 대기
+            self.page.wait_for_selector('.item, .property, .list-item', timeout=10000)
+            
+            properties = self.page.query_selector_all('.item, .property, .list-item')
+            
+            for i, prop in enumerate(properties[:15]):  # 최대 15개
+                if not self.is_crawling:
+                    break
+                
+                try:
+                    data = {'type': '부동산'}
+                    
+                    # 제목 (주소/매물명)
+                    if self.extract_title.get():
+                        title_elem = prop.query_selector('.item-title, .property-title, .title, h3, h4')
+                        if title_elem:
+                            data['title'] = title_elem.text_content().strip()
+                        else:
+                            data['title'] = f"매물 {i+1}"
+                    
+                    # 가격
+                    if self.extract_price.get():
+                        price_elem = prop.query_selector('.price, .item-price, .property-price')
+                        if price_elem:
+                            data['price'] = price_elem.text_content().strip()
+                    
+                    # 매물 링크
+                    link_elem = prop.query_selector('a')
+                    if link_elem:
+                        data['url'] = link_elem.get_attribute('href')
+                        if data['url'] and not data['url'].startswith('http'):
+                            base_url = f"{self.page.url.split('/')[0]}//{self.page.url.split('/')[2]}"
+                            data['url'] = base_url + data['url']
+                    else:
+                        data['url'] = self.page.url
+                    
+                    # 설명
+                    data['description'] = f"부동산 매물 (페이지 {self.current_page})"
+                    
+                    self.crawled_data.append(data)
+                    self.root.after(0, self.add_to_table, data)
+                    
+                except Exception:
+                    continue
+                    
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): self.status_var.set(f"부동산 Playwright 크롤링 오류: {err[:50]}"))
 
 def main():
     root = tk.Tk()

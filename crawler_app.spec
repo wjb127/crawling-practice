@@ -8,16 +8,19 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 datas = []
 datas += collect_data_files('selenium')
 datas += collect_data_files('webdriver_manager')
+datas += collect_data_files('playwright')
 datas += collect_data_files('tkinter')
 
 # 숨겨진 imports 수집
 hiddenimports = []
 hiddenimports += collect_submodules('selenium')
 hiddenimports += collect_submodules('webdriver_manager')
+hiddenimports += collect_submodules('playwright')
 hiddenimports += ['tkinter', 'tkinter.ttk', 'tkinter.scrolledtext', 'tkinter.filedialog', 'tkinter.messagebox']
 hiddenimports += ['requests', 'bs4', 'lxml', 'openpyxl', 'pandas', 'numpy']
 hiddenimports += ['urllib3', 'certifi', 'charset_normalizer', 'idna']
 hiddenimports += ['trio', 'trio_websocket', 'websocket', 'wsproto']
+hiddenimports += ['playwright.sync_api', 'playwright._impl']
 
 a = Analysis(
     ['main.py'],
