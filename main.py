@@ -1926,11 +1926,6 @@ class WebCrawlerApp:
         except Exception as e:
             self.root.after(0, lambda err=str(e): self.status_var.set(f"부동산 Playwright 크롤링 오류: {err[:50]}"))
 
-def main():
-    root = tk.Tk()
-    app = WebCrawlerApp(root)
-    root.mainloop()
-
     # 알림 관련 메서드들
     def add_keyword(self):
         """키워드를 추가합니다."""
@@ -2899,6 +2894,11 @@ URL: {url}
         # 체크포인트 정리 (작업 완료시)
         if self.auto_save.get():
             self.clear_checkpoint()
+
+def main():
+    root = tk.Tk()
+    app = WebCrawlerApp(root)
+    root.mainloop()
 
 if __name__ == "__main__":
     main() 
