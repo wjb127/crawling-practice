@@ -2644,7 +2644,7 @@ URL: {url}
         except Exception as e:
             messagebox.showerror("재시작 오류", f"크롤링 재시작 중 오류가 발생했습니다:\n{str(e)}")
     
-    def clear_checkpoint(self):
+    def clear_checkpoint(self, show_message=True):
         """체크포인트를 삭제합니다."""
         try:
             if os.path.exists(self.checkpoint_file):
@@ -2660,10 +2660,16 @@ URL: {url}
             self.current_task = None
             
             self.update_checkpoint_status()
-            messagebox.showinfo("체크포인트 삭제", "체크포인트가 삭제되었습니다.")
+            
+            # 메시지 표시 여부를 선택적으로 처리
+            if show_message:
+                messagebox.showinfo("체크포인트 삭제", "체크포인트가 삭제되었습니다.")
             
         except Exception as e:
-            messagebox.showerror("삭제 오류", f"체크포인트 삭제 중 오류가 발생했습니다:\n{str(e)}")
+            if show_message:
+                messagebox.showerror("삭제 오류", f"체크포인트 삭제 중 오류가 발생했습니다:\n{str(e)}")
+            else:
+                print(f"체크포인트 삭제 오류: {str(e)}")
     
     def update_checkpoint_status(self):
         """체크포인트 상태를 업데이트합니다."""
@@ -2891,9 +2897,9 @@ URL: {url}
         
         self.status_var.set(status_msg)
         
-        # 체크포인트 정리 (작업 완료시)
+        # 체크포인트 정리 (작업 완료시) - 메시지 없이 자동 삭제
         if self.auto_save.get():
-            self.clear_checkpoint()
+            self.clear_checkpoint(show_message=False)
 
 def main():
     root = tk.Tk()
