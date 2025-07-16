@@ -209,6 +209,13 @@ class WebCrawlerApp:
         # 테이블 뷰 생성
         self.create_table_view()
         
+        # 스마트 뷰 탭 (고급 기능)
+        self.smart_view_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.smart_view_frame, text="🎯 스마트 뷰")
+        
+        # 스마트 뷰어는 나중에 초기화
+        self.smart_viewer = None
+        
         # 사이트 추천 탭
         self.recommend_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.recommend_frame, text="사이트 추천")
@@ -2995,9 +3002,44 @@ URL: {url}
         
         self.status_var.set(status_msg)
         
+        # 스마트 뷰 업데이트
+        self.update_smart_view()
+        
         # 체크포인트 정리 (작업 완료시) - 메시지 없이 자동 삭제
         if self.auto_save.get():
             self.clear_checkpoint(show_message=False)
+    
+    def update_smart_view(self):
+        """스마트 뷰 업데이트"""
+        try:
+            # 크롤링된 데이터가 있을 때만 스마트 뷰어 생성/업데이트
+            if self.crawled_data:
+                # 크롤링 시간 추가
+                for item in self.crawled_data:
+                    if 'crawl_time' not in item:
+                        item['crawl_time'] = datetime.now()
+                
+                # 고급 UI 모듈 import (필요시에만)
+                try:
+                    from advanced_ui import AdvancedResultsViewer
+                    
+                    # 기존 스마트 뷰어가 있다면 제거
+                    for widget in self.smart_view_frame.winfo_children():
+                        widget.destroy()
+                    
+                    # 새로운 스마트 뷰어 생성
+                    self.smart_viewer = AdvancedResultsViewer(self.smart_view_frame, self.crawled_data)
+                    
+                except ImportError:
+                    # advanced_ui 모듈이 없으면 기본 메시지 표시
+                    ttk.Label(self.smart_view_frame, 
+                             text="스마트 뷰 기능을 사용하려면 advanced_ui.py 파일이 필요합니다.").pack(pady=20)
+                except Exception as e:
+                    print(f"[DEBUG] 스마트 뷰 생성 오류: {e}")
+                    ttk.Label(self.smart_view_frame, 
+                             text=f"스마트 뷰 로드 중 오류 발생: {str(e)}").pack(pady=20)
+        except Exception as e:
+            print(f"[DEBUG] 스마트 뷰 업데이트 오류: {e}")
 
 def main():
     root = tk.Tk()
