@@ -5,10 +5,21 @@ from bs4 import BeautifulSoup
 import threading
 from urllib.parse import urljoin, urlparse
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import time
 import re
+import unicodedata
+import json
+import pickle
+import smtplib
+import email.mime.text
+import email.mime.multipart
+MimeText = email.mime.text.MIMEText
+MimeMultipart = email.mime.multipart.MIMEMultipart
+import schedule
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -17,6 +28,22 @@ from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
+
+# 선택적 import (없어도 프로그램 실행 가능)
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    import seaborn as sns
+    CHART_AVAILABLE = True
+except ImportError:
+    CHART_AVAILABLE = False
+
+try:
+    from plyer import notification
+    NOTIFICATION_AVAILABLE = True
+except ImportError:
+    NOTIFICATION_AVAILABLE = False
 
 # Playwright 관련 import (선택적)
 try:
@@ -39,10 +66,13 @@ class WebCrawlerApp:
         url_frame = ttk.LabelFrame(main_frame, text="크롤링 설정", padding="5")
         url_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        ttk.Label(url_frame, text="URL:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        ttk.Label(url_frame, text="URL (엔터키로 시작):").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
         self.url_var = tk.StringVar(value="https://example.com")
         self.url_entry = ttk.Entry(url_frame, textvariable=self.url_var, width=60)
         self.url_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 5))
+        
+        # URL 입력창에 키보드 단축키 바인딩 추가
+        self.setup_url_entry_bindings()
         
         self.crawl_button = ttk.Button(url_frame, text="크롤링 시작", command=self.start_crawling)
         self.crawl_button.grid(row=0, column=2, padx=(5, 0))
@@ -120,6 +150,9 @@ class WebCrawlerApp:
         self.extract_description = tk.BooleanVar(value=False)
         ttk.Checkbutton(data_frame, text="설명", variable=self.extract_description).grid(row=0, column=4, sticky=tk.W, padx=(5, 0))
         
+        self.extract_images = tk.BooleanVar(value=False)
+        ttk.Checkbutton(data_frame, text="이미지", variable=self.extract_images).grid(row=0, column=5, sticky=tk.W, padx=(5, 0))
+        
         # 진행상황 표시
         self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
         self.progress.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
@@ -190,6 +223,21 @@ class WebCrawlerApp:
         self.tech_text = scrolledtext.ScrolledText(self.tech_frame, height=8, wrap=tk.WORD)
         self.tech_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
+        # 알림 설정 탭
+        self.alert_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.alert_frame, text="알림 설정")
+        self.setup_alert_tab()
+        
+        # 데이터 분석 탭
+        self.analysis_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.analysis_frame, text="데이터 분석")
+        self.setup_analysis_tab()
+        
+        # 스케줄링 탭
+        self.schedule_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.schedule_frame, text="스케줄링")
+        self.setup_schedule_tab()
+        
         # 상태 표시줄
         self.status_var = tk.StringVar(value="준비")
         status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN)
@@ -205,7 +253,8 @@ class WebCrawlerApp:
         
         # 각 탭의 그리드 설정
         for frame in [self.info_frame, self.links_frame, self.images_frame, self.content_frame, 
-                      self.table_frame, self.recommend_frame, self.tech_frame]:
+                      self.table_frame, self.recommend_frame, self.tech_frame, self.alert_frame, 
+                      self.analysis_frame, self.schedule_frame]:
             frame.columnconfigure(0, weight=1)
             frame.rowconfigure(0, weight=1)
         
@@ -222,8 +271,388 @@ class WebCrawlerApp:
         self.retry_count = 0
         self.max_retries = 3
         
+        # 알림 및 분석 관련 변수
+        self.alert_settings = {
+            'email_enabled': False,
+            'notification_enabled': True,
+            'price_threshold': 0,
+            'keywords': []
+        }
+        self.historical_data = []
+        self.monitoring_active = False
+        
+        # 스케줄링 관련 변수
+        self.scheduler = BackgroundScheduler()
+        self.scheduler.start()
+        self.scheduled_jobs = []
+        
+        # 중단점 재시작 관련 변수
+        self.checkpoint_file = "crawling_checkpoint.pkl"
+        self.current_task = None
+        self.task_progress = {
+            'total_pages': 0,
+            'completed_pages': 0,
+            'failed_pages': [],
+            'current_url': '',
+            'settings': {}
+        }
+        
         # 탭 내용 초기화
         self.load_static_content()
+    
+    def setup_alert_tab(self):
+        """알림 설정 탭을 구성합니다."""
+        # 스크롤 가능한 프레임
+        canvas = tk.Canvas(self.alert_frame)
+        scrollbar = ttk.Scrollbar(self.alert_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 알림 설정 섹션
+        alert_config = ttk.LabelFrame(scrollable_frame, text="알림 설정", padding="10")
+        alert_config.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10), padx=10)
+        
+        # 데스크탑 알림 설정
+        self.notification_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(alert_config, text="데스크탑 알림 사용", 
+                       variable=self.notification_enabled).grid(row=0, column=0, sticky=tk.W, pady=2)
+        
+        # 이메일 알림 설정
+        self.email_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(alert_config, text="이메일 알림 사용", 
+                       variable=self.email_enabled).grid(row=1, column=0, sticky=tk.W, pady=2)
+        
+        # 이메일 설정 프레임
+        email_frame = ttk.LabelFrame(alert_config, text="이메일 설정", padding="5")
+        email_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(email_frame, text="발신 이메일:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.sender_email = tk.StringVar()
+        ttk.Entry(email_frame, textvariable=self.sender_email, width=30).grid(row=0, column=1, sticky=(tk.W, tk.E))
+        
+        ttk.Label(email_frame, text="앱 비밀번호:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        self.sender_password = tk.StringVar()
+        ttk.Entry(email_frame, textvariable=self.sender_password, show="*", width=30).grid(row=1, column=1, sticky=(tk.W, tk.E))
+        
+        ttk.Label(email_frame, text="수신 이메일:").grid(row=2, column=0, sticky=tk.W, padx=(0, 5))
+        self.receiver_email = tk.StringVar()
+        ttk.Entry(email_frame, textvariable=self.receiver_email, width=30).grid(row=2, column=1, sticky=(tk.W, tk.E))
+        
+        # 가격 알림 설정
+        price_frame = ttk.LabelFrame(scrollable_frame, text="가격 알림 설정", padding="10")
+        price_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10), padx=10)
+        
+        ttk.Label(price_frame, text="가격 변동 임계값:").grid(row=0, column=0, sticky=tk.W)
+        self.price_threshold = tk.StringVar(value="10")
+        ttk.Entry(price_frame, textvariable=self.price_threshold, width=10).grid(row=0, column=1, sticky=tk.W, padx=(5, 5))
+        ttk.Label(price_frame, text="%").grid(row=0, column=2, sticky=tk.W)
+        
+        # 키워드 알림 설정
+        keyword_frame = ttk.LabelFrame(scrollable_frame, text="키워드 알림 설정", padding="10")
+        keyword_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10), padx=10)
+        
+        ttk.Label(keyword_frame, text="모니터링 키워드:").grid(row=0, column=0, sticky=tk.W)
+        self.keyword_entry = tk.StringVar()
+        keyword_entry_widget = ttk.Entry(keyword_frame, textvariable=self.keyword_entry, width=30)
+        keyword_entry_widget.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(5, 5))
+        
+        ttk.Button(keyword_frame, text="추가", command=self.add_keyword).grid(row=0, column=2, padx=(5, 0))
+        
+        # 키워드 목록
+        self.keyword_listbox = tk.Listbox(keyword_frame, height=4)
+        self.keyword_listbox.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(5, 0))
+        
+        ttk.Button(keyword_frame, text="키워드 삭제", command=self.remove_keyword).grid(row=2, column=0, pady=(5, 0))
+        
+        # 모니터링 제어 버튼
+        control_frame = ttk.LabelFrame(scrollable_frame, text="모니터링 제어", padding="10")
+        control_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10), padx=10)
+        
+        self.monitor_button = ttk.Button(control_frame, text="모니터링 시작", command=self.toggle_monitoring)
+        self.monitor_button.grid(row=0, column=0, padx=(0, 5))
+        
+        ttk.Button(control_frame, text="알림 테스트", command=self.test_notification).grid(row=0, column=1, padx=(5, 0))
+        
+        # 스크롤바 설정
+        canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+    def setup_analysis_tab(self):
+        """데이터 분석 탭을 구성합니다."""
+        # 메인 프레임
+        main_analysis_frame = ttk.Frame(self.analysis_frame)
+        main_analysis_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=10, pady=10)
+        
+        # 분석 옵션 프레임
+        options_frame = ttk.LabelFrame(main_analysis_frame, text="분석 옵션", padding="10")
+        options_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # 차트 타입 선택
+        ttk.Label(options_frame, text="차트 타입:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.chart_type = tk.StringVar(value="가격 추이")
+        chart_combo = ttk.Combobox(options_frame, textvariable=self.chart_type, 
+                                 values=["가격 추이", "키워드 빈도", "사이트별 통계", "시간대별 분포"])
+        chart_combo.grid(row=0, column=1, sticky=tk.W, padx=(0, 10))
+        
+        # 분석 버튼
+        ttk.Button(options_frame, text="차트 생성", command=self.generate_chart).grid(row=0, column=2, padx=(5, 0))
+        ttk.Button(options_frame, text="리포트 생성", command=self.generate_report).grid(row=0, column=3, padx=(5, 0))
+        
+        # 차트 표시 영역
+        self.chart_frame = ttk.LabelFrame(main_analysis_frame, text="차트", padding="5")
+        self.chart_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        
+        # 통계 정보 표시 영역
+        stats_frame = ttk.LabelFrame(main_analysis_frame, text="통계 정보", padding="5")
+        stats_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        self.stats_text = scrolledtext.ScrolledText(stats_frame, height=6, wrap=tk.WORD)
+        self.stats_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 차트 사용 불가 시 안내
+        if not CHART_AVAILABLE:
+            ttk.Label(self.chart_frame, text="차트 기능을 사용하려면 matplotlib 라이브러리를 설치해주세요.\n'pip install matplotlib seaborn'").grid(row=0, column=0, pady=20)
+    
+    def setup_schedule_tab(self):
+        """스케줄링 탭을 구성합니다."""
+        # 스크롤 가능한 프레임
+        canvas = tk.Canvas(self.schedule_frame)
+        scrollbar = ttk.Scrollbar(self.schedule_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # 스케줄 설정 섹션
+        schedule_config = ttk.LabelFrame(scrollable_frame, text="스케줄 설정", padding="10")
+        schedule_config.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10), padx=10)
+        
+        # 스케줄 타입 선택
+        ttk.Label(schedule_config, text="실행 주기:").grid(row=0, column=0, sticky=tk.W, padx=(0, 5))
+        self.schedule_type = tk.StringVar(value="일회성")
+        schedule_combo = ttk.Combobox(schedule_config, textvariable=self.schedule_type, 
+                                    values=["일회성", "매일", "매주", "매월"], width=15)
+        schedule_combo.grid(row=0, column=1, sticky=tk.W, padx=(0, 10))
+        
+        # 시간 설정
+        ttk.Label(schedule_config, text="실행 시간:").grid(row=1, column=0, sticky=tk.W, padx=(0, 5))
+        time_frame = ttk.Frame(schedule_config)
+        time_frame.grid(row=1, column=1, sticky=tk.W, pady=5)
+        
+        self.schedule_hour = tk.StringVar(value="09")
+        ttk.Spinbox(time_frame, from_=0, to=23, textvariable=self.schedule_hour, width=5, format="%02.0f").grid(row=0, column=0)
+        ttk.Label(time_frame, text=":").grid(row=0, column=1)
+        self.schedule_minute = tk.StringVar(value="00")
+        ttk.Spinbox(time_frame, from_=0, to=59, textvariable=self.schedule_minute, width=5, format="%02.0f").grid(row=0, column=2)
+        
+        # 요일 선택 (주간 스케줄용)
+        ttk.Label(schedule_config, text="요일 (매주):").grid(row=2, column=0, sticky=tk.W, padx=(0, 5))
+        self.schedule_weekday = tk.StringVar(value="월요일")
+        weekday_combo = ttk.Combobox(schedule_config, textvariable=self.schedule_weekday,
+                                   values=["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"], width=15)
+        weekday_combo.grid(row=2, column=1, sticky=tk.W)
+        
+        # 일자 설정 (월간 스케줄용)
+        ttk.Label(schedule_config, text="일자 (매월):").grid(row=3, column=0, sticky=tk.W, padx=(0, 5))
+        self.schedule_day = tk.StringVar(value="1")
+        ttk.Spinbox(schedule_config, from_=1, to=28, textvariable=self.schedule_day, width=5).grid(row=3, column=1, sticky=tk.W)
+        
+        # 이메일 결과 전송 설정
+        self.email_results = tk.BooleanVar(value=True)
+        ttk.Checkbutton(schedule_config, text="결과를 이메일로 전송", 
+                       variable=self.email_results).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=5)
+        
+        # 스케줄 제어 버튼
+        control_frame = ttk.Frame(schedule_config)
+        control_frame.grid(row=5, column=0, columnspan=2, pady=10)
+        
+        ttk.Button(control_frame, text="스케줄 추가", command=self.add_schedule).grid(row=0, column=0, padx=(0, 5))
+        ttk.Button(control_frame, text="스케줄 삭제", command=self.remove_schedule).grid(row=0, column=1, padx=(5, 0))
+        
+        # 활성 스케줄 목록
+        schedule_list_frame = ttk.LabelFrame(scrollable_frame, text="활성 스케줄", padding="10")
+        schedule_list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10), padx=10)
+        
+        # 스케줄 목록 트리뷰
+        columns = ('ID', 'Type', 'Time', 'Next Run', 'Status')
+        self.schedule_tree = ttk.Treeview(schedule_list_frame, columns=columns, show='headings', height=6)
+        
+        self.schedule_tree.heading('ID', text='ID')
+        self.schedule_tree.heading('Type', text='타입')
+        self.schedule_tree.heading('Time', text='시간')
+        self.schedule_tree.heading('Next Run', text='다음 실행')
+        self.schedule_tree.heading('Status', text='상태')
+        
+        self.schedule_tree.column('ID', width=50)
+        self.schedule_tree.column('Type', width=80)
+        self.schedule_tree.column('Time', width=100)
+        self.schedule_tree.column('Next Run', width=150)
+        self.schedule_tree.column('Status', width=80)
+        
+        self.schedule_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # 복구 기능 섹션
+        recovery_frame = ttk.LabelFrame(scrollable_frame, text="복구 기능", padding="10")
+        recovery_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10), padx=10)
+        
+        # 체크포인트 상태
+        self.checkpoint_status = tk.StringVar(value="체크포인트 없음")
+        ttk.Label(recovery_frame, textvariable=self.checkpoint_status).grid(row=0, column=0, columnspan=2, pady=5)
+        
+        # 복구 버튼
+        recovery_control = ttk.Frame(recovery_frame)
+        recovery_control.grid(row=1, column=0, columnspan=2, pady=5)
+        
+        ttk.Button(recovery_control, text="마지막 작업 복구", command=self.restore_last_task).grid(row=0, column=0, padx=(0, 5))
+        ttk.Button(recovery_control, text="체크포인트 삭제", command=self.clear_checkpoint).grid(row=0, column=1, padx=(5, 0))
+        
+        # 자동 저장 설정
+        self.auto_save = tk.BooleanVar(value=True)
+        ttk.Checkbutton(recovery_frame, text="자동 체크포인트 저장", 
+                       variable=self.auto_save).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=5)
+        
+        # 스크롤바 설정
+        canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        # 체크포인트 상태 업데이트
+        self.update_checkpoint_status()
+    
+    def setup_url_entry_bindings(self):
+        """URL 입력창에 키보드 단축키 바인딩을 설정합니다."""
+        import platform
+        
+        # 운영체제 감지
+        system = platform.system()
+        
+        if system == "Darwin":  # macOS
+            # Cmd+A: 전체 선택
+            self.url_entry.bind('<Command-a>', self.select_all_url)
+            # Cmd+C: 복사
+            self.url_entry.bind('<Command-c>', self.copy_url)
+            # Cmd+V: 붙여넣기
+            self.url_entry.bind('<Command-v>', self.paste_url)
+            # Cmd+X: 잘라내기
+            self.url_entry.bind('<Command-x>', self.cut_url)
+            # Cmd+Z: 실행취소
+            self.url_entry.bind('<Command-z>', self.undo_url)
+        else:  # Windows, Linux
+            # Ctrl+A: 전체 선택
+            self.url_entry.bind('<Control-a>', self.select_all_url)
+            # Ctrl+C: 복사
+            self.url_entry.bind('<Control-c>', self.copy_url)
+            # Ctrl+V: 붙여넣기
+            self.url_entry.bind('<Control-v>', self.paste_url)
+            # Ctrl+X: 잘라내기
+            self.url_entry.bind('<Control-x>', self.cut_url)
+            # Ctrl+Z: 실행취소
+            self.url_entry.bind('<Control-z>', self.undo_url)
+        
+        # 우클릭 컨텍스트 메뉴 추가
+        self.url_entry.bind('<Button-2>', self.show_context_menu)  # macOS
+        self.url_entry.bind('<Button-3>', self.show_context_menu)  # Windows/Linux
+        
+        # 포커스 시 전체 선택 (선택사항)
+        self.url_entry.bind('<FocusIn>', self.on_url_focus)
+        
+        # 엔터키로 크롤링 시작
+        self.url_entry.bind('<Return>', self.on_url_enter)
+        self.url_entry.bind('<KP_Enter>', self.on_url_enter)  # 숫자패드 엔터키도 지원
+    
+    def select_all_url(self, event=None):
+        """URL 입력창의 모든 텍스트를 선택합니다."""
+        self.url_entry.select_range(0, tk.END)
+        return 'break'
+    
+    def copy_url(self, event=None):
+        """선택된 텍스트를 클립보드로 복사합니다."""
+        try:
+            if self.url_entry.selection_present():
+                text = self.url_entry.selection_get()
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+        except tk.TclError:
+            pass
+        return 'break'
+    
+    def paste_url(self, event=None):
+        """클립보드의 내용을 현재 커서 위치에 붙여넣습니다."""
+        try:
+            clipboard_text = self.root.clipboard_get()
+            # 현재 선택된 텍스트가 있으면 대체, 없으면 커서 위치에 삽입
+            if self.url_entry.selection_present():
+                self.url_entry.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            self.url_entry.insert(tk.INSERT, clipboard_text)
+        except tk.TclError:
+            pass
+        return 'break'
+    
+    def cut_url(self, event=None):
+        """선택된 텍스트를 잘라내어 클립보드로 복사합니다."""
+        try:
+            if self.url_entry.selection_present():
+                text = self.url_entry.selection_get()
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                self.url_entry.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            pass
+        return 'break'
+    
+    def undo_url(self, event=None):
+        """마지막 작업을 실행취소합니다."""
+        try:
+            self.url_entry.edit_undo()
+        except tk.TclError:
+            pass
+        return 'break'
+    
+    def show_context_menu(self, event):
+        """우클릭 컨텍스트 메뉴를 표시합니다."""
+        # 컨텍스트 메뉴 생성
+        context_menu = tk.Menu(self.root, tearoff=0)
+        context_menu.add_command(label="잘라내기", command=lambda: self.cut_url())
+        context_menu.add_command(label="복사", command=lambda: self.copy_url())
+        context_menu.add_command(label="붙여넣기", command=lambda: self.paste_url())
+        context_menu.add_separator()
+        context_menu.add_command(label="전체 선택", command=lambda: self.select_all_url())
+        context_menu.add_separator()
+        context_menu.add_command(label="실행취소", command=lambda: self.undo_url())
+        
+        try:
+            context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            context_menu.grab_release()
+    
+    def on_url_focus(self, event=None):
+        """URL 입력창이 포커스를 받을 때 호출됩니다."""
+        # 기본 URL이 있을 때만 전체 선택 (선택사항)
+        if self.url_var.get() == "https://example.com":
+            self.root.after(50, self.select_all_url)  # 약간의 지연 후 선택
+    
+    def on_url_enter(self, event=None):
+        """URL 입력창에서 엔터키를 누를 때 호출됩니다."""
+        # 크롤링이 진행 중이 아니고 크롤링 버튼이 활성화되어 있을 때만 실행
+        if not self.is_crawling and self.crawl_button['state'] != 'disabled':
+            # URL이 비어있지 않은지 확인
+            url = self.url_var.get().strip()
+            if url:
+                # 크롤링 시작 버튼 클릭과 동일한 동작
+                self.start_crawling()
+                return 'break'  # 이벤트 전파 중단
+        return None
     
     def create_table_view(self):
         """결과 테이블 뷰를 생성합니다."""
@@ -296,38 +725,66 @@ class WebCrawlerApp:
                 pass
             self.playwright = None
     
-    def start_crawling(self):
+    def start_crawling(self, scheduled=False):
         """백그라운드에서 크롤링을 시작합니다."""
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showerror("오류", "URL을 입력해주세요.")
+            if not scheduled:
+                messagebox.showerror("오류", "URL을 입력해주세요.")
             return
         
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
             self.url_var.set(url)
         
-        # UI 상태 변경
-        self.crawl_button.config(state='disabled')
-        self.stop_button.config(state='normal')
-        self.export_button.config(state='disabled')
-        self.progress.start()
+        # 현재 작업 정보 저장
+        self.current_task = {
+            'url': url,
+            'browser_mode': self.browser_mode.get(),
+            'max_pages': int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1,
+            'crawl_delay': float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1,
+            'site_type': self.site_type.get(),
+            'started_at': datetime.now(),
+            'scheduled': scheduled
+        }
+        
+        # 진행 상황 초기화
+        self.task_progress = {
+            'total_pages': self.current_task['max_pages'],
+            'completed_pages': 0,
+            'failed_pages': [],
+            'current_url': url,
+            'settings': self.current_task.copy()
+        }
+        
+        # UI 상태 변경 (스케줄된 작업이 아닐 때만)
+        if not scheduled:
+            self.crawl_button.config(state='disabled')
+            self.stop_button.config(state='normal')
+            self.export_button.config(state='disabled')
+            self.progress.start()
+        
         self.status_var.set("크롤링 중...")
         self.is_crawling = True
         
         # 결과 영역 초기화
-        self.clear_results()
+        if not scheduled:
+            self.clear_results()
         self.crawled_data = []
         self.current_page = 1
         self.retry_count = 0
         
+        # 체크포인트 저장
+        if self.auto_save.get():
+            self.save_checkpoint()
+        
         # 백그라운드 스레드에서 크롤링 실행
         if self.browser_mode.get() == "selenium":
-            thread = threading.Thread(target=self.crawl_with_selenium, args=(url,))
+            thread = threading.Thread(target=self.crawl_with_selenium_checkpoint, args=(url, scheduled))
         elif self.browser_mode.get() == "playwright":
-            thread = threading.Thread(target=self.crawl_with_playwright, args=(url,))
+            thread = threading.Thread(target=self.crawl_with_playwright_checkpoint, args=(url, scheduled))
         else:
-            thread = threading.Thread(target=self.crawl_website, args=(url,))
+            thread = threading.Thread(target=self.crawl_website_checkpoint, args=(url, scheduled))
         thread.daemon = True
         thread.start()
     
@@ -819,6 +1276,8 @@ class WebCrawlerApp:
                 for key, value in item.items():
                     # 텍스트 데이터 정리 및 인코딩 처리
                     if isinstance(value, str):
+                        # 유니코드 정규화
+                        value = unicodedata.normalize('NFC', value)
                         # 특수문자 및 제어문자 제거
                         value = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value)
                         # 연속된 공백 정리
@@ -835,8 +1294,7 @@ class WebCrawlerApp:
             # 엑셀 파일로 저장 - 한글 지원 강화
             with pd.ExcelWriter(
                 file_path, 
-                engine='openpyxl',
-                options={'encoding': 'utf-8'}
+                engine='openpyxl'
             ) as writer:
                 # 시트명을 영문으로 변경 (일부 Excel 버전 호환성)
                 sheet_name = 'CrawlingResults'
@@ -845,16 +1303,20 @@ class WebCrawlerApp:
                 # 워크시트 가져오기 및 서식 설정
                 worksheet = writer.sheets[sheet_name]
                 
-                # 헤더 스타일 설정
-                from openpyxl.styles import Font, PatternFill, Alignment
-                header_font = Font(bold=True, color="FFFFFF")
-                header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-                
-                # 헤더 행 스타일 적용
-                for cell in worksheet[1]:
-                    cell.font = header_font
-                    cell.fill = header_fill
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                # 스타일 import를 try-except로 감싸서 오류 방지
+                try:
+                    from openpyxl.styles import Font, PatternFill, Alignment
+                    header_font = Font(bold=True, color="FFFFFF")
+                    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+                    
+                    # 헤더 행 스타일 적용
+                    for cell in worksheet[1]:
+                        cell.font = header_font
+                        cell.fill = header_fill
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                except ImportError:
+                    # 스타일 라이브러리를 불러올 수 없는 경우 무시
+                    pass
                 
                 # 컬럼 너비 자동 조정 - 한글 텍스트 고려
                 for column in worksheet.columns:
@@ -1468,6 +1930,975 @@ def main():
     root = tk.Tk()
     app = WebCrawlerApp(root)
     root.mainloop()
+
+    # 알림 관련 메서드들
+    def add_keyword(self):
+        """키워드를 추가합니다."""
+        keyword = self.keyword_entry.get().strip()
+        if keyword and keyword not in self.keyword_listbox.get(0, tk.END):
+            self.keyword_listbox.insert(tk.END, keyword)
+            self.keyword_entry.set("")
+    
+    def remove_keyword(self):
+        """선택된 키워드를 삭제합니다."""
+        try:
+            selection = self.keyword_listbox.curselection()
+            if selection:
+                self.keyword_listbox.delete(selection[0])
+        except:
+            pass
+    
+    def toggle_monitoring(self):
+        """모니터링을 시작/중지합니다."""
+        if self.monitoring_active:
+            self.monitoring_active = False
+            self.monitor_button.config(text="모니터링 시작")
+            self.status_var.set("모니터링 중지됨")
+        else:
+            self.monitoring_active = True
+            self.monitor_button.config(text="모니터링 중지")
+            self.status_var.set("모니터링 시작됨")
+            # 백그라운드에서 모니터링 실행
+            threading.Thread(target=self.run_monitoring, daemon=True).start()
+    
+    def run_monitoring(self):
+        """백그라운드에서 모니터링을 실행합니다."""
+        while self.monitoring_active:
+            try:
+                # 현재 설정된 URL로 크롤링 실행
+                url = self.url_var.get().strip()
+                if url:
+                    self.check_for_alerts(url)
+                time.sleep(300)  # 5분마다 체크
+            except Exception as e:
+                print(f"모니터링 오류: {e}")
+                time.sleep(60)  # 오류 시 1분 후 재시도
+    
+    def check_for_alerts(self, url):
+        """알림 조건을 체크합니다."""
+        try:
+            # 간단한 크롤링으로 현재 데이터 확인
+            response = requests.get(url, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # 가격 정보 추출 (간단한 패턴)
+            price_elements = soup.find_all(text=re.compile(r'[\d,]+원|[\$][\d,]+|\$[\d,.]+'))
+            
+            # 키워드 체크
+            keywords = list(self.keyword_listbox.get(0, tk.END))
+            page_text = soup.get_text().lower()
+            
+            alert_messages = []
+            
+            # 키워드 알림 체크
+            for keyword in keywords:
+                if keyword.lower() in page_text:
+                    alert_messages.append(f"키워드 '{keyword}'가 발견되었습니다!")
+            
+            # 가격 변동 체크 (기본적인 구현)
+            if price_elements and self.historical_data:
+                current_prices = [self.extract_number(price.strip()) for price in price_elements[:3]]
+                
+                # 이전 데이터와 비교
+                if len(self.historical_data) > 0:
+                    prev_data = self.historical_data[-1]
+                    threshold = float(self.price_threshold.get() or 10)
+                    
+                    for i, current_price in enumerate(current_prices):
+                        if current_price and i < len(prev_data.get('prices', [])):
+                            prev_price = prev_data['prices'][i]
+                            if prev_price and current_price:
+                                change_percent = abs((current_price - prev_price) / prev_price * 100)
+                                if change_percent >= threshold:
+                                    alert_messages.append(f"가격 변동 감지: {change_percent:.1f}% 변화")
+            
+            # 현재 데이터 저장
+            current_data = {
+                'timestamp': datetime.now(),
+                'url': url,
+                'prices': [self.extract_number(price.strip()) for price in price_elements[:3]],
+                'keywords_found': [kw for kw in keywords if kw.lower() in page_text]
+            }
+            self.historical_data.append(current_data)
+            
+            # 데이터 제한 (최근 100개만 유지)
+            if len(self.historical_data) > 100:
+                self.historical_data = self.historical_data[-100:]
+            
+            # 알림 발송
+            if alert_messages:
+                self.send_alerts(alert_messages, url)
+                
+        except Exception as e:
+            print(f"알림 체크 오류: {e}")
+    
+    def extract_number(self, text):
+        """텍스트에서 숫자를 추출합니다."""
+        try:
+            # 숫자와 콤마만 추출
+            numbers = re.findall(r'[\d,]+', text.replace(',', ''))
+            if numbers:
+                return float(numbers[0])
+        except:
+            pass
+        return None
+    
+    def send_alerts(self, messages, url):
+        """알림을 발송합니다."""
+        alert_text = "\n".join(messages)
+        alert_title = "웹 크롤링 알림"
+        
+        # 데스크탑 알림
+        if self.notification_enabled.get() and NOTIFICATION_AVAILABLE:
+            try:
+                notification.notify(
+                    title=alert_title,
+                    message=alert_text,
+                    timeout=10
+                )
+            except Exception as e:
+                print(f"데스크탑 알림 오류: {e}")
+        
+        # 이메일 알림
+        if self.email_enabled.get():
+            self.send_email_alert(alert_title, alert_text, url)
+    
+    def send_email_alert(self, subject, message, url):
+        """이메일 알림을 발송합니다."""
+        try:
+            sender_email = self.sender_email.get()
+            sender_password = self.sender_password.get()
+            receiver_email = self.receiver_email.get()
+            
+            if not all([sender_email, sender_password, receiver_email]):
+                print("이메일 설정이 완료되지 않았습니다.")
+                return
+            
+            # 이메일 메시지 구성
+            msg = MimeMultipart()
+            msg['From'] = sender_email
+            msg['To'] = receiver_email
+            msg['Subject'] = subject
+            
+            body = f"""
+웹 크롤링 알림
+
+URL: {url}
+시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+알림 내용:
+{message}
+
+자동 발송된 메시지입니다.
+            """
+            
+            msg.attach(MimeText(body, 'plain', 'utf-8'))
+            
+            # Gmail SMTP 서버 설정
+            server = smtplib.SMTP('smtp.gmail.com', 587)
+            server.starttls()
+            server.login(sender_email, sender_password)
+            
+            server.send_message(msg)
+            server.quit()
+            
+            print("이메일 알림 발송 완료")
+            
+        except Exception as e:
+            print(f"이메일 발송 오류: {e}")
+    
+    def test_notification(self):
+        """알림 테스트를 실행합니다."""
+        test_messages = ["테스트 알림입니다.", "알림 설정이 정상적으로 작동합니다."]
+        self.send_alerts(test_messages, "테스트 URL")
+        messagebox.showinfo("테스트 완료", "알림 테스트가 완료되었습니다.")
+    
+    # 데이터 분석 관련 메서드들
+    def generate_chart(self):
+        """차트를 생성합니다."""
+        if not CHART_AVAILABLE:
+            messagebox.showerror("오류", "차트 기능을 사용하려면 matplotlib 라이브러리를 설치해주세요.")
+            return
+        
+        if not self.historical_data and not self.crawled_data:
+            messagebox.showwarning("경고", "분석할 데이터가 없습니다. 먼저 크롤링을 실행해주세요.")
+            return
+        
+        chart_type = self.chart_type.get()
+        
+        try:
+            # 기존 차트 제거
+            for widget in self.chart_frame.winfo_children():
+                widget.destroy()
+            
+            # matplotlib 한글 폰트 설정
+            plt.rcParams['font.family'] = ['AppleGothic'] if os.name == 'posix' else ['Malgun Gothic']
+            plt.rcParams['axes.unicode_minus'] = False
+            
+            fig, ax = plt.subplots(figsize=(8, 5))
+            
+            if chart_type == "가격 추이":
+                self.create_price_trend_chart(ax)
+            elif chart_type == "키워드 빈도":
+                self.create_keyword_frequency_chart(ax)
+            elif chart_type == "사이트별 통계":
+                self.create_site_statistics_chart(ax)
+            elif chart_type == "시간대별 분포":
+                self.create_time_distribution_chart(ax)
+            
+            # 차트를 tkinter에 표시
+            canvas = FigureCanvasTkAgg(fig, self.chart_frame)
+            canvas.draw()
+            canvas.get_tk_widget().grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+            
+        except Exception as e:
+            messagebox.showerror("차트 생성 오류", f"차트 생성 중 오류가 발생했습니다:\n{str(e)}")
+    
+    def create_price_trend_chart(self, ax):
+        """가격 추이 차트를 생성합니다."""
+        if not self.historical_data:
+            ax.text(0.5, 0.5, '가격 데이터가 없습니다', ha='center', va='center', transform=ax.transAxes)
+            return
+        
+        timestamps = [data['timestamp'] for data in self.historical_data]
+        prices = []
+        
+        for data in self.historical_data:
+            if data['prices'] and data['prices'][0]:
+                prices.append(data['prices'][0])
+            else:
+                prices.append(0)
+        
+        ax.plot(timestamps, prices, marker='o', linewidth=2, markersize=4)
+        ax.set_title('가격 추이')
+        ax.set_xlabel('시간')
+        ax.set_ylabel('가격')
+        ax.grid(True, alpha=0.3)
+        
+        # x축 날짜 포맷 설정
+        import matplotlib.dates as mdates
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+    
+    def create_keyword_frequency_chart(self, ax):
+        """키워드 빈도 차트를 생성합니다."""
+        keyword_counts = {}
+        
+        # 크롤링 데이터에서 키워드 빈도 계산
+        for data in self.crawled_data:
+            title = data.get('title', '').lower()
+            description = data.get('description', '').lower()
+            text = title + ' ' + description
+            
+            # 간단한 단어 분리 (한글/영문)
+            words = re.findall(r'[가-힣]{2,}|[a-zA-Z]{3,}', text)
+            for word in words:
+                keyword_counts[word] = keyword_counts.get(word, 0) + 1
+        
+        if not keyword_counts:
+            ax.text(0.5, 0.5, '키워드 데이터가 없습니다', ha='center', va='center', transform=ax.transAxes)
+            return
+        
+        # 상위 10개 키워드
+        top_keywords = sorted(keyword_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        keywords, counts = zip(*top_keywords)
+        
+        ax.bar(keywords, counts)
+        ax.set_title('키워드 빈도')
+        ax.set_xlabel('키워드')
+        ax.set_ylabel('빈도')
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+    
+    def create_site_statistics_chart(self, ax):
+        """사이트별 통계 차트를 생성합니다."""
+        site_counts = {}
+        
+        for data in self.crawled_data:
+            url = data.get('url', '')
+            domain = urlparse(url).netloc
+            site_counts[domain] = site_counts.get(domain, 0) + 1
+        
+        if not site_counts:
+            ax.text(0.5, 0.5, '사이트 데이터가 없습니다', ha='center', va='center', transform=ax.transAxes)
+            return
+        
+        sites, counts = zip(*site_counts.items())
+        ax.pie(counts, labels=sites, autopct='%1.1f%%')
+        ax.set_title('사이트별 데이터 분포')
+    
+    def create_time_distribution_chart(self, ax):
+        """시간대별 분포 차트를 생성합니다."""
+        if not self.historical_data:
+            ax.text(0.5, 0.5, '시간 데이터가 없습니다', ha='center', va='center', transform=ax.transAxes)
+            return
+        
+        hours = [data['timestamp'].hour for data in self.historical_data]
+        hour_counts = {}
+        for hour in hours:
+            hour_counts[hour] = hour_counts.get(hour, 0) + 1
+        
+        hours_list = list(range(24))
+        counts_list = [hour_counts.get(hour, 0) for hour in hours_list]
+        
+        ax.bar(hours_list, counts_list)
+        ax.set_title('시간대별 활동 분포')
+        ax.set_xlabel('시간')
+        ax.set_ylabel('활동 횟수')
+        ax.set_xticks(range(0, 24, 2))
+    
+    def generate_report(self):
+        """분석 리포트를 생성합니다."""
+        if not self.crawled_data and not self.historical_data:
+            messagebox.showwarning("경고", "분석할 데이터가 없습니다.")
+            return
+        
+        # 통계 계산
+        total_items = len(self.crawled_data)
+        total_monitoring = len(self.historical_data)
+        
+        # 사이트별 통계
+        site_stats = {}
+        for data in self.crawled_data:
+            site_type = data.get('type', '기타')
+            site_stats[site_type] = site_stats.get(site_type, 0) + 1
+        
+        # 리포트 텍스트 생성
+        report = f"""크롤링 데이터 분석 리포트
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+생성 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+📊 전체 통계
+• 총 크롤링 항목: {total_items}개
+• 모니터링 기록: {total_monitoring}개
+
+📈 사이트별 분포
+"""
+        
+        for site_type, count in site_stats.items():
+            percentage = (count / total_items * 100) if total_items > 0 else 0
+            report += f"• {site_type}: {count}개 ({percentage:.1f}%)\n"
+        
+        if self.historical_data:
+            report += f"""
+⏰ 모니터링 정보
+• 첫 기록: {self.historical_data[0]['timestamp'].strftime('%Y-%m-%d %H:%M')}
+• 마지막 기록: {self.historical_data[-1]['timestamp'].strftime('%Y-%m-%d %H:%M')}
+• 총 모니터링 기간: {(self.historical_data[-1]['timestamp'] - self.historical_data[0]['timestamp']).days}일
+"""
+        
+        # 키워드 분석
+        if self.keyword_listbox.size() > 0:
+            keywords = list(self.keyword_listbox.get(0, tk.END))
+            report += f"""
+🔍 모니터링 키워드
+• 설정된 키워드: {', '.join(keywords)}
+"""
+        
+        report += f"""
+📋 분석 권장사항
+• 데이터가 충분히 쌓이면 더 정확한 트렌드 분석이 가능합니다
+• 정기적인 모니터링으로 변화 패턴을 파악하세요
+• 알림 설정을 통해 중요한 변화를 놓치지 마세요
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        # 통계 텍스트 영역에 표시
+        self.stats_text.delete(1.0, tk.END)
+        self.stats_text.insert(1.0, report)
+        
+        messagebox.showinfo("리포트 생성 완료", "분석 리포트가 생성되었습니다.")
+    
+    # 스케줄링 관련 메서드들
+    def add_schedule(self):
+        """새로운 스케줄을 추가합니다."""
+        schedule_type = self.schedule_type.get()
+        hour = int(self.schedule_hour.get())
+        minute = int(self.schedule_minute.get())
+        
+        try:
+            if schedule_type == "일회성":
+                # 오늘 또는 내일 지정된 시간에 실행
+                now = datetime.now()
+                scheduled_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if scheduled_time <= now:
+                    scheduled_time += timedelta(days=1)
+                
+                job = self.scheduler.add_job(
+                    func=self.scheduled_crawl,
+                    trigger='date',
+                    run_date=scheduled_time,
+                    id=f"onetime_{scheduled_time.strftime('%Y%m%d_%H%M%S')}"
+                )
+                
+            elif schedule_type == "매일":
+                job = self.scheduler.add_job(
+                    func=self.scheduled_crawl,
+                    trigger=CronTrigger(hour=hour, minute=minute),
+                    id=f"daily_{hour:02d}{minute:02d}"
+                )
+                
+            elif schedule_type == "매주":
+                weekday_map = {"월요일": 0, "화요일": 1, "수요일": 2, "목요일": 3, 
+                             "금요일": 4, "토요일": 5, "일요일": 6}
+                weekday = weekday_map[self.schedule_weekday.get()]
+                
+                job = self.scheduler.add_job(
+                    func=self.scheduled_crawl,
+                    trigger=CronTrigger(day_of_week=weekday, hour=hour, minute=minute),
+                    id=f"weekly_{weekday}_{hour:02d}{minute:02d}"
+                )
+                
+            elif schedule_type == "매월":
+                day = int(self.schedule_day.get())
+                job = self.scheduler.add_job(
+                    func=self.scheduled_crawl,
+                    trigger=CronTrigger(day=day, hour=hour, minute=minute),
+                    id=f"monthly_{day}_{hour:02d}{minute:02d}"
+                )
+            
+            self.scheduled_jobs.append({
+                'job': job,
+                'type': schedule_type,
+                'time': f"{hour:02d}:{minute:02d}",
+                'email_results': self.email_results.get()
+            })
+            
+            self.update_schedule_list()
+            messagebox.showinfo("스케줄 추가", f"{schedule_type} 스케줄이 추가되었습니다.")
+            
+        except Exception as e:
+            messagebox.showerror("스케줄 추가 오류", f"스케줄 추가 중 오류가 발생했습니다:\n{str(e)}")
+    
+    def remove_schedule(self):
+        """선택된 스케줄을 삭제합니다."""
+        try:
+            selection = self.schedule_tree.selection()
+            if not selection:
+                messagebox.showwarning("선택 필요", "삭제할 스케줄을 선택해주세요.")
+                return
+            
+            item = self.schedule_tree.item(selection[0])
+            job_id = item['values'][0]
+            
+            # 스케줄러에서 작업 제거
+            self.scheduler.remove_job(job_id)
+            
+            # 목록에서 제거
+            self.scheduled_jobs = [job for job in self.scheduled_jobs if job['job'].id != job_id]
+            
+            self.update_schedule_list()
+            messagebox.showinfo("스케줄 삭제", "선택된 스케줄이 삭제되었습니다.")
+            
+        except Exception as e:
+            messagebox.showerror("스케줄 삭제 오류", f"스케줄 삭제 중 오류가 발생했습니다:\n{str(e)}")
+    
+    def update_schedule_list(self):
+        """스케줄 목록을 업데이트합니다."""
+        # 기존 항목 삭제
+        for item in self.schedule_tree.get_children():
+            self.schedule_tree.delete(item)
+        
+        # 현재 스케줄 목록 추가
+        for job_info in self.scheduled_jobs:
+            job = job_info['job']
+            next_run = job.next_run_time.strftime('%Y-%m-%d %H:%M:%S') if job.next_run_time else "N/A"
+            
+            self.schedule_tree.insert('', 'end', values=(
+                job.id,
+                job_info['type'],
+                job_info['time'],
+                next_run,
+                "활성"
+            ))
+    
+    def scheduled_crawl(self):
+        """스케줄된 크롤링을 실행합니다."""
+        try:
+            # 스케줄된 크롤링 실행
+            self.start_crawling(scheduled=True)
+            
+            # 크롤링 완료까지 대기 (최대 30분)
+            wait_time = 0
+            while self.is_crawling and wait_time < 1800:  # 30분
+                time.sleep(10)
+                wait_time += 10
+            
+            # 결과 이메일 발송
+            if self.email_results.get() and self.email_enabled.get():
+                self.send_crawling_results_email()
+                
+        except Exception as e:
+            print(f"스케줄된 크롤링 오류: {e}")
+    
+    def send_crawling_results_email(self):
+        """크롤링 결과를 이메일로 전송합니다."""
+        try:
+            if not self.crawled_data:
+                return
+            
+            # 결과 요약 생성
+            total_items = len(self.crawled_data)
+            sites = set(urlparse(item.get('url', '')).netloc for item in self.crawled_data)
+            
+            # 엑셀 파일 생성
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            excel_filename = f"scheduled_crawling_{timestamp}.xlsx"
+            
+            # 임시로 엑셀 파일 저장
+            processed_data = []
+            for item in self.crawled_data:
+                processed_item = {}
+                for key, value in item.items():
+                    if isinstance(value, str):
+                        value = unicodedata.normalize('NFC', value)
+                        value = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value)
+                        value = re.sub(r'\s+', ' ', value).strip()
+                        if len(value) > 32000:
+                            value = value[:32000] + "..."
+                    processed_item[key] = value
+                processed_data.append(processed_item)
+            
+            df = pd.DataFrame(processed_data)
+            df.columns = ['타입', '제목/텍스트', 'URL', '설명']
+            
+            with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='CrawlingResults', index=False)
+            
+            # 이메일 내용 구성
+            subject = f"웹 크롤링 결과 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            
+            body = f"""
+자동 웹 크롤링 결과
+
+실행 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+크롤링 URL: {self.current_task['url'] if self.current_task else 'N/A'}
+
+📊 결과 요약:
+• 총 수집 항목: {total_items}개
+• 크롤링 사이트: {len(sites)}개
+• 파일명: {excel_filename}
+
+상세 결과는 첨부된 엑셀 파일을 확인해주세요.
+
+자동 발송된 메시지입니다.
+            """
+            
+            # 파일 첨부 이메일 발송
+            self.send_email_with_attachment(subject, body, excel_filename)
+            
+            # 임시 파일 삭제
+            if os.path.exists(excel_filename):
+                os.remove(excel_filename)
+                
+        except Exception as e:
+            print(f"결과 이메일 발송 오류: {e}")
+    
+    def send_email_with_attachment(self, subject, body, filename):
+        """첨부파일이 있는 이메일을 발송합니다."""
+        try:
+            from email.mime.base import MimeBase
+            from email import encoders
+            
+            sender_email = self.sender_email.get()
+            sender_password = self.sender_password.get()
+            receiver_email = self.receiver_email.get()
+            
+            if not all([sender_email, sender_password, receiver_email]):
+                print("이메일 설정이 완료되지 않았습니다.")
+                return
+            
+            msg = MimeMultipart()
+            msg['From'] = sender_email
+            msg['To'] = receiver_email
+            msg['Subject'] = subject
+            
+            # 본문 추가
+            msg.attach(MimeText(body, 'plain', 'utf-8'))
+            
+            # 파일 첨부
+            if os.path.exists(filename):
+                with open(filename, "rb") as attachment:
+                    part = MimeBase('application', 'octet-stream')
+                    part.set_payload(attachment.read())
+                
+                encoders.encode_base64(part)
+                part.add_header(
+                    'Content-Disposition',
+                    f'attachment; filename= {os.path.basename(filename)}'
+                )
+                msg.attach(part)
+            
+            # 이메일 발송
+            server = smtplib.SMTP('smtp.gmail.com', 587)
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+            server.quit()
+            
+            print("첨부파일 이메일 발송 완료")
+            
+        except Exception as e:
+            print(f"첨부파일 이메일 발송 오류: {e}")
+    
+    # 체크포인트 및 복구 관련 메서드들
+    def save_checkpoint(self):
+        """현재 진행 상황을 체크포인트로 저장합니다."""
+        try:
+            checkpoint_data = {
+                'task_progress': self.task_progress,
+                'current_task': self.current_task,
+                'crawled_data': self.crawled_data,
+                'timestamp': datetime.now(),
+                'current_page': self.current_page,
+                'retry_count': self.retry_count
+            }
+            
+            with open(self.checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint_data, f)
+            
+            self.update_checkpoint_status()
+            
+        except Exception as e:
+            print(f"체크포인트 저장 오류: {e}")
+    
+    def load_checkpoint(self):
+        """저장된 체크포인트를 로드합니다."""
+        try:
+            if not os.path.exists(self.checkpoint_file):
+                return None
+            
+            with open(self.checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            
+            return checkpoint_data
+            
+        except Exception as e:
+            print(f"체크포인트 로드 오류: {e}")
+            return None
+    
+    def restore_last_task(self):
+        """마지막 작업을 복구합니다."""
+        checkpoint_data = self.load_checkpoint()
+        
+        if not checkpoint_data:
+            messagebox.showwarning("복구 불가", "복구할 체크포인트가 없습니다.")
+            return
+        
+        try:
+            # 체크포인트 데이터 복원
+            self.task_progress = checkpoint_data['task_progress']
+            self.current_task = checkpoint_data['current_task']
+            self.crawled_data = checkpoint_data['crawled_data']
+            self.current_page = checkpoint_data.get('current_page', 1)
+            self.retry_count = checkpoint_data.get('retry_count', 0)
+            
+            # UI 설정 복원
+            if self.current_task:
+                self.url_var.set(self.current_task['url'])
+                self.browser_mode.set(self.current_task['browser_mode'])
+                self.max_pages.set(str(self.current_task['max_pages']))
+                self.crawl_delay.set(str(self.current_task['crawl_delay']))
+                self.site_type.set(self.current_task['site_type'])
+            
+            # 진행 상황 표시
+            completed = self.task_progress['completed_pages']
+            total = self.task_progress['total_pages']
+            
+            result = messagebox.askyesno(
+                "작업 복구", 
+                f"마지막 작업을 발견했습니다.\n\n"
+                f"URL: {self.current_task['url']}\n"
+                f"진행률: {completed}/{total} 페이지\n"
+                f"시작 시간: {self.current_task['started_at'].strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"이 작업을 이어서 실행하시겠습니까?"
+            )
+            
+            if result:
+                # 크롤링 재시작
+                self.resume_crawling()
+            
+        except Exception as e:
+            messagebox.showerror("복구 오류", f"작업 복구 중 오류가 발생했습니다:\n{str(e)}")
+    
+    def resume_crawling(self):
+        """중단된 크롤링을 재시작합니다."""
+        try:
+            self.is_crawling = True
+            self.status_var.set(f"복구된 작업 재시작 중... ({self.task_progress['completed_pages']}/{self.task_progress['total_pages']})")
+            
+            # UI 상태 변경
+            self.crawl_button.config(state='disabled')
+            self.stop_button.config(state='normal')
+            self.progress.start()
+            
+            # 실패한 페이지부터 재시작
+            url = self.current_task['url']
+            
+            if self.current_task['browser_mode'] == "selenium":
+                thread = threading.Thread(target=self.crawl_with_selenium_checkpoint, args=(url, False, True))
+            elif self.current_task['browser_mode'] == "playwright":
+                thread = threading.Thread(target=self.crawl_with_playwright_checkpoint, args=(url, False, True))
+            else:
+                thread = threading.Thread(target=self.crawl_website_checkpoint, args=(url, False, True))
+            
+            thread.daemon = True
+            thread.start()
+            
+        except Exception as e:
+            messagebox.showerror("재시작 오류", f"크롤링 재시작 중 오류가 발생했습니다:\n{str(e)}")
+    
+    def clear_checkpoint(self):
+        """체크포인트를 삭제합니다."""
+        try:
+            if os.path.exists(self.checkpoint_file):
+                os.remove(self.checkpoint_file)
+            
+            self.task_progress = {
+                'total_pages': 0,
+                'completed_pages': 0,
+                'failed_pages': [],
+                'current_url': '',
+                'settings': {}
+            }
+            self.current_task = None
+            
+            self.update_checkpoint_status()
+            messagebox.showinfo("체크포인트 삭제", "체크포인트가 삭제되었습니다.")
+            
+        except Exception as e:
+            messagebox.showerror("삭제 오류", f"체크포인트 삭제 중 오류가 발생했습니다:\n{str(e)}")
+    
+    def update_checkpoint_status(self):
+        """체크포인트 상태를 업데이트합니다."""
+        try:
+            if os.path.exists(self.checkpoint_file):
+                checkpoint_data = self.load_checkpoint()
+                if checkpoint_data:
+                    timestamp = checkpoint_data['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                    completed = checkpoint_data['task_progress']['completed_pages']
+                    total = checkpoint_data['task_progress']['total_pages']
+                    self.checkpoint_status.set(f"체크포인트 있음: {timestamp} ({completed}/{total})")
+                else:
+                    self.checkpoint_status.set("체크포인트 파일 손상됨")
+            else:
+                self.checkpoint_status.set("체크포인트 없음")
+        except:
+            self.checkpoint_status.set("체크포인트 상태 확인 불가")
+    
+    # 체크포인트를 포함한 크롤링 메서드들
+    def crawl_website_checkpoint(self, url, scheduled=False, resume=False):
+        """체크포인트 기능이 포함된 기본 크롤링"""
+        try:
+            start_page = self.current_page if resume else 1
+            max_pages = int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1
+            
+            for page in range(start_page, max_pages + 1):
+                if not self.is_crawling:
+                    break
+                
+                self.current_page = page
+                self.task_progress['completed_pages'] = page - 1
+                
+                # 체크포인트 저장
+                if self.auto_save.get() and page % 5 == 0:  # 5페이지마다 저장
+                    self.save_checkpoint()
+                
+                # 페이지 크롤링 시도
+                success = False
+                for retry in range(self.max_retries):
+                    try:
+                        page_url = self.generate_page_url(url, page)
+                        response = self.crawl_with_retry(page_url)
+                        
+                        if response:
+                            soup = BeautifulSoup(response.content, 'html.parser')
+                            self.root.after(0, self.update_results, page_url, response, soup)
+                            success = True
+                            break
+                            
+                    except Exception as e:
+                        self.root.after(0, lambda r=retry+1, err=str(e): self.status_var.set(f"페이지 {page} 오류, 재시도 {r}/{self.max_retries}: {err[:30]}"))
+                        time.sleep(2)
+                
+                if not success:
+                    self.task_progress['failed_pages'].append(page)
+                
+                # 크롤링 간격
+                if page < max_pages and self.is_crawling:
+                    time.sleep(float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1)
+            
+            # 작업 완료 처리
+            self.root.after(0, self.finalize_crawling_checkpoint, scheduled)
+            
+        except Exception as e:
+            self.root.after(0, self.show_error, f"체크포인트 크롤링 오류: {str(e)}")
+    
+    def crawl_with_selenium_checkpoint(self, url, scheduled=False, resume=False):
+        """체크포인트 기능이 포함된 Selenium 크롤링"""
+        if not self.setup_selenium_driver():
+            return
+        
+        try:
+            start_page = self.current_page if resume else 1
+            max_pages = int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1
+            
+            for page in range(start_page, max_pages + 1):
+                if not self.is_crawling:
+                    break
+                
+                self.current_page = page
+                self.task_progress['completed_pages'] = page - 1
+                
+                # 체크포인트 저장
+                if self.auto_save.get() and page % 3 == 0:  # 3페이지마다 저장
+                    self.save_checkpoint()
+                
+                success = False
+                for retry in range(self.max_retries):
+                    try:
+                        page_url = self.generate_page_url(url, page)
+                        self.driver.get(page_url)
+                        WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located((By.TAG_NAME, "body"))
+                        )
+                        
+                        # 사이트별 특화 크롤링
+                        if self.site_type.get() == "네이버 쇼핑":
+                            self.crawl_naver_shopping()
+                        elif self.site_type.get() == "인스타그램":
+                            self.crawl_instagram()
+                        elif self.site_type.get() == "부동산":
+                            self.crawl_real_estate()
+                        else:
+                            self.crawl_general_selenium()
+                        
+                        success = True
+                        break
+                        
+                    except Exception as e:
+                        self.root.after(0, lambda r=retry+1, err=str(e): self.status_var.set(f"Selenium 페이지 {page} 재시도 {r}/{self.max_retries}: {err[:30]}"))
+                        time.sleep(2)
+                
+                if not success:
+                    self.task_progress['failed_pages'].append(page)
+                
+                if page < max_pages and self.is_crawling:
+                    time.sleep(float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1)
+            
+            self.root.after(0, self.finalize_crawling_checkpoint, scheduled)
+            
+        except Exception as e:
+            self.root.after(0, self.show_error, f"Selenium 체크포인트 크롤링 오류: {str(e)}")
+        finally:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except:
+                    pass
+                self.driver = None
+    
+    def crawl_with_playwright_checkpoint(self, url, scheduled=False, resume=False):
+        """체크포인트 기능이 포함된 Playwright 크롤링"""
+        if not self.setup_playwright():
+            return
+        
+        try:
+            start_page = self.current_page if resume else 1
+            max_pages = int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1
+            
+            for page in range(start_page, max_pages + 1):
+                if not self.is_crawling:
+                    break
+                
+                self.current_page = page
+                self.task_progress['completed_pages'] = page - 1
+                
+                # 체크포인트 저장
+                if self.auto_save.get() and page % 3 == 0:  # 3페이지마다 저장
+                    self.save_checkpoint()
+                
+                success = False
+                for retry in range(self.max_retries):
+                    try:
+                        page_url = self.generate_page_url(url, page)
+                        self.page.goto(page_url, wait_until='domcontentloaded', timeout=30000)
+                        self.page.wait_for_load_state('networkidle', timeout=10000)
+                        self.page.wait_for_timeout(2000)
+                        
+                        domain = urlparse(page_url).netloc.lower()
+                        if 'shopping.naver.com' in domain:
+                            self.crawl_naver_shopping_playwright()
+                        elif 'instagram.com' in domain:
+                            self.crawl_instagram_playwright()
+                        elif any(keyword in domain for keyword in ['zigbang', 'dabang', '부동산']):
+                            self.crawl_real_estate_playwright()
+                        else:
+                            self.crawl_general_playwright()
+                        
+                        success = True
+                        break
+                        
+                    except Exception as e:
+                        self.root.after(0, lambda r=retry+1, err=str(e): self.status_var.set(f"Playwright 페이지 {page} 재시도 {r}/{self.max_retries}: {err[:30]}"))
+                        time.sleep(2)
+                
+                if not success:
+                    self.task_progress['failed_pages'].append(page)
+                
+                if page < max_pages and self.is_crawling:
+                    time.sleep(float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1)
+            
+            self.root.after(0, self.finalize_crawling_checkpoint, scheduled)
+            
+        except Exception as e:
+            self.root.after(0, self.show_error, f"Playwright 체크포인트 크롤링 오류: {str(e)}")
+        finally:
+            # Playwright 정리
+            if self.page:
+                try:
+                    self.page.close()
+                except:
+                    pass
+                self.page = None
+            
+            if self.browser:
+                try:
+                    self.browser.close()
+                except:
+                    pass
+                self.browser = None
+            
+            if self.playwright:
+                try:
+                    self.playwright.stop()
+                except:
+                    pass
+                self.playwright = None
+    
+    def finalize_crawling_checkpoint(self, scheduled=False):
+        """체크포인트 기능이 포함된 크롤링 완료 처리"""
+        self.progress.stop()
+        if not scheduled:
+            self.crawl_button.config(state='normal')
+            self.stop_button.config(state='disabled')
+            self.export_button.config(state='normal')
+        
+        self.is_crawling = False
+        
+        total_items = len(self.crawled_data)
+        failed_pages = len(self.task_progress['failed_pages'])
+        
+        status_msg = f"크롤링 완료 - 총 {total_items}개 데이터 수집"
+        if failed_pages > 0:
+            status_msg += f" (실패: {failed_pages}페이지)"
+        
+        self.status_var.set(status_msg)
+        
+        # 체크포인트 정리 (작업 완료시)
+        if self.auto_save.get():
+            self.clear_checkpoint()
 
 if __name__ == "__main__":
     main() 
