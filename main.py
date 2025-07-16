@@ -729,8 +729,13 @@ class WebCrawlerApp:
     
     def start_crawling(self, scheduled=False):
         """백그라운드에서 크롤링을 시작합니다."""
+        print(f"[DEBUG] 크롤링 시작 요청됨 - 스케줄됨: {scheduled}")
+        
         url = self.url_var.get().strip()
+        print(f"[DEBUG] 입력된 URL: '{url}'")
+        
         if not url:
+            print(f"[DEBUG] URL이 비어있음")
             if not scheduled:
                 messagebox.showerror("오류", "URL을 입력해주세요.")
             return
@@ -738,29 +743,44 @@ class WebCrawlerApp:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
             self.url_var.set(url)
+            print(f"[DEBUG] URL 프로토콜 추가: {url}")
         
         # 현재 작업 정보 저장
+        browser_mode = self.browser_mode.get()
+        max_pages = int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1
+        crawl_delay = float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1
+        site_type = self.site_type.get()
+        
+        print(f"[DEBUG] 크롤링 설정:")
+        print(f"  - 브라우저 모드: {browser_mode}")
+        print(f"  - 최대 페이지: {max_pages}")
+        print(f"  - 크롤링 간격: {crawl_delay}초")
+        print(f"  - 사이트 타입: {site_type}")
+        
         self.current_task = {
             'url': url,
-            'browser_mode': self.browser_mode.get(),
-            'max_pages': int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1,
-            'crawl_delay': float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1,
-            'site_type': self.site_type.get(),
+            'browser_mode': browser_mode,
+            'max_pages': max_pages,
+            'crawl_delay': crawl_delay,
+            'site_type': site_type,
             'started_at': datetime.now(),
             'scheduled': scheduled
         }
         
         # 진행 상황 초기화
         self.task_progress = {
-            'total_pages': self.current_task['max_pages'],
+            'total_pages': max_pages,
             'completed_pages': 0,
             'failed_pages': [],
             'current_url': url,
             'settings': self.current_task.copy()
         }
         
+        print(f"[DEBUG] 작업 정보 저장 완료")
+        
         # UI 상태 변경 (스케줄된 작업이 아닐 때만)
         if not scheduled:
+            print(f"[DEBUG] UI 상태 변경 중...")
             self.crawl_button.config(state='disabled')
             self.stop_button.config(state='normal')
             self.export_button.config(state='disabled')
@@ -771,6 +791,7 @@ class WebCrawlerApp:
         
         # 결과 영역 초기화
         if not scheduled:
+            print(f"[DEBUG] 결과 영역 초기화 중...")
             self.clear_results()
         self.crawled_data = []
         self.current_page = 1
@@ -778,17 +799,22 @@ class WebCrawlerApp:
         
         # 체크포인트 저장
         if self.auto_save.get():
+            print(f"[DEBUG] 초기 체크포인트 저장 중...")
             self.save_checkpoint()
         
         # 백그라운드 스레드에서 크롤링 실행
-        if self.browser_mode.get() == "selenium":
+        print(f"[DEBUG] 백그라운드 스레드 시작 - 모드: {browser_mode}")
+        
+        if browser_mode == "selenium":
             thread = threading.Thread(target=self.crawl_with_selenium_checkpoint, args=(url, scheduled))
-        elif self.browser_mode.get() == "playwright":
+        elif browser_mode == "playwright":
             thread = threading.Thread(target=self.crawl_with_playwright_checkpoint, args=(url, scheduled))
         else:
             thread = threading.Thread(target=self.crawl_website_checkpoint, args=(url, scheduled))
+        
         thread.daemon = True
         thread.start()
+        print(f"[DEBUG] 백그라운드 스레드 시작됨")
     
     def clear_results(self):
         """결과 영역을 초기화합니다."""
@@ -2694,18 +2720,25 @@ URL: {url}
     def crawl_website_checkpoint(self, url, scheduled=False, resume=False):
         """체크포인트 기능이 포함된 기본 크롤링"""
         try:
+            print(f"[DEBUG] 크롤링 시작 - URL: {url}, 스케줄됨: {scheduled}, 재시작: {resume}")
+            
             start_page = self.current_page if resume else 1
             max_pages = int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1
             
+            print(f"[DEBUG] 페이지 범위: {start_page} ~ {max_pages}")
+            
             for page in range(start_page, max_pages + 1):
                 if not self.is_crawling:
+                    print(f"[DEBUG] 크롤링 중지됨 (페이지 {page})")
                     break
                 
+                print(f"[DEBUG] 페이지 {page} 크롤링 시작")
                 self.current_page = page
                 self.task_progress['completed_pages'] = page - 1
                 
                 # 체크포인트 저장
                 if self.auto_save.get() and page % 5 == 0:  # 5페이지마다 저장
+                    print(f"[DEBUG] 체크포인트 저장 중 (페이지 {page})")
                     self.save_checkpoint()
                 
                 # 페이지 크롤링 시도
@@ -2713,92 +2746,148 @@ URL: {url}
                 for retry in range(self.max_retries):
                     try:
                         page_url = self.generate_page_url(url, page)
-                        response = self.crawl_with_retry(page_url)
+                        print(f"[DEBUG] 요청 URL: {page_url} (재시도 {retry+1}/{self.max_retries})")
                         
-                        if response:
-                            soup = BeautifulSoup(response.content, 'html.parser')
-                            self.root.after(0, self.update_results, page_url, response, soup)
-                            success = True
-                            break
+                        # HTTP 요청 수행
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                        }
+                        
+                        print(f"[DEBUG] HTTP 요청 시작: headers={headers}")
+                        response = requests.get(page_url, headers=headers, timeout=10)
+                        print(f"[DEBUG] HTTP 응답 수신: status_code={response.status_code}, encoding={response.encoding}")
+                        
+                        response.raise_for_status()
+                        
+                        # 한글 인코딩 처리
+                        if response.encoding == 'ISO-8859-1':
+                            response.encoding = response.apparent_encoding
+                        elif not response.encoding:
+                            response.encoding = 'utf-8'
+                        
+                        print(f"[DEBUG] 인코딩 처리 완료: {response.encoding}")
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        print(f"[DEBUG] BeautifulSoup 파싱 완료")
+                        
+                        self.root.after(0, self.update_results, page_url, response, soup)
+                        success = True
+                        break
                             
                     except Exception as e:
+                        print(f"[DEBUG] 크롤링 오류 (재시도 {retry+1}): {str(e)}")
                         self.root.after(0, lambda r=retry+1, err=str(e): self.status_var.set(f"페이지 {page} 오류, 재시도 {r}/{self.max_retries}: {err[:30]}"))
                         time.sleep(2)
                 
                 if not success:
+                    print(f"[DEBUG] 페이지 {page} 크롤링 실패 - 실패 목록에 추가")
                     self.task_progress['failed_pages'].append(page)
+                else:
+                    print(f"[DEBUG] 페이지 {page} 크롤링 성공")
                 
                 # 크롤링 간격
                 if page < max_pages and self.is_crawling:
-                    time.sleep(float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1)
+                    delay = float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1
+                    print(f"[DEBUG] {delay}초 대기 중...")
+                    time.sleep(delay)
             
             # 작업 완료 처리
+            print(f"[DEBUG] 크롤링 완료 처리 시작")
             self.root.after(0, self.finalize_crawling_checkpoint, scheduled)
             
         except Exception as e:
+            print(f"[DEBUG] 치명적 오류: {str(e)}")
+            import traceback
+            traceback.print_exc()
             self.root.after(0, self.show_error, f"체크포인트 크롤링 오류: {str(e)}")
     
     def crawl_with_selenium_checkpoint(self, url, scheduled=False, resume=False):
         """체크포인트 기능이 포함된 Selenium 크롤링"""
+        print(f"[DEBUG] Selenium 크롤링 시작 - URL: {url}")
+        
         if not self.setup_selenium_driver():
+            print(f"[DEBUG] Selenium 드라이버 설정 실패")
             return
         
         try:
             start_page = self.current_page if resume else 1
             max_pages = int(self.max_pages.get()) if self.max_pages.get().isdigit() else 1
+            print(f"[DEBUG] Selenium 페이지 범위: {start_page} ~ {max_pages}")
             
             for page in range(start_page, max_pages + 1):
                 if not self.is_crawling:
+                    print(f"[DEBUG] Selenium 크롤링 중지됨 (페이지 {page})")
                     break
                 
+                print(f"[DEBUG] Selenium 페이지 {page} 크롤링 시작")
                 self.current_page = page
                 self.task_progress['completed_pages'] = page - 1
                 
                 # 체크포인트 저장
                 if self.auto_save.get() and page % 3 == 0:  # 3페이지마다 저장
+                    print(f"[DEBUG] Selenium 체크포인트 저장 중 (페이지 {page})")
                     self.save_checkpoint()
                 
                 success = False
                 for retry in range(self.max_retries):
                     try:
                         page_url = self.generate_page_url(url, page)
+                        print(f"[DEBUG] Selenium 페이지 로드: {page_url} (재시도 {retry+1})")
+                        
                         self.driver.get(page_url)
+                        print(f"[DEBUG] Selenium 페이지 로드 완료")
+                        
                         WebDriverWait(self.driver, 10).until(
                             EC.presence_of_element_located((By.TAG_NAME, "body"))
                         )
+                        print(f"[DEBUG] Selenium body 요소 로드 완료")
                         
                         # 사이트별 특화 크롤링
-                        if self.site_type.get() == "네이버 쇼핑":
+                        site_type = self.site_type.get()
+                        print(f"[DEBUG] 사이트 타입: {site_type}")
+                        
+                        if site_type == "네이버 쇼핑":
                             self.crawl_naver_shopping()
-                        elif self.site_type.get() == "인스타그램":
+                        elif site_type == "인스타그램":
                             self.crawl_instagram()
-                        elif self.site_type.get() == "부동산":
+                        elif site_type == "부동산":
                             self.crawl_real_estate()
                         else:
                             self.crawl_general_selenium()
                         
+                        print(f"[DEBUG] Selenium 페이지 {page} 크롤링 성공")
                         success = True
                         break
                         
                     except Exception as e:
+                        print(f"[DEBUG] Selenium 오류 (재시도 {retry+1}): {str(e)}")
                         self.root.after(0, lambda r=retry+1, err=str(e): self.status_var.set(f"Selenium 페이지 {page} 재시도 {r}/{self.max_retries}: {err[:30]}"))
                         time.sleep(2)
                 
                 if not success:
+                    print(f"[DEBUG] Selenium 페이지 {page} 크롤링 실패")
                     self.task_progress['failed_pages'].append(page)
                 
                 if page < max_pages and self.is_crawling:
-                    time.sleep(float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1)
+                    delay = float(self.crawl_delay.get()) if self.crawl_delay.get().replace('.', '').isdigit() else 1
+                    print(f"[DEBUG] Selenium {delay}초 대기 중...")
+                    time.sleep(delay)
             
+            print(f"[DEBUG] Selenium 크롤링 완료 처리 시작")
             self.root.after(0, self.finalize_crawling_checkpoint, scheduled)
             
         except Exception as e:
+            print(f"[DEBUG] Selenium 치명적 오류: {str(e)}")
+            import traceback
+            traceback.print_exc()
             self.root.after(0, self.show_error, f"Selenium 체크포인트 크롤링 오류: {str(e)}")
         finally:
             if self.driver:
                 try:
+                    print(f"[DEBUG] Selenium 드라이버 종료 중...")
                     self.driver.quit()
+                    print(f"[DEBUG] Selenium 드라이버 종료 완료")
                 except:
+                    print(f"[DEBUG] Selenium 드라이버 종료 실패")
                     pass
                 self.driver = None
     
