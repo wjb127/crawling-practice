@@ -614,8 +614,10 @@ class WebCrawlerApp:
     def undo_url(self, event=None):
         """마지막 작업을 실행취소합니다."""
         try:
-            self.url_entry.edit_undo()
-        except tk.TclError:
+            # macOS tkinter에서 edit_undo를 지원하지 않으므로 대체 기능
+            # 이전 상태로 되돌리기 대신 전체 선택 기능 제공
+            self.url_entry.select_range(0, tk.END)
+        except (tk.TclError, AttributeError):
             pass
         return 'break'
     
