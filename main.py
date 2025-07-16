@@ -150,7 +150,7 @@ class WebCrawlerApp:
         self.extract_description = tk.BooleanVar(value=False)
         ttk.Checkbutton(data_frame, text="설명", variable=self.extract_description).grid(row=0, column=4, sticky=tk.W, padx=(5, 0))
         
-        self.extract_images = tk.BooleanVar(value=False)
+        # extract_images는 이미 위에서 정의됨 (중복 제거)
         ttk.Checkbutton(data_frame, text="이미지", variable=self.extract_images).grid(row=0, column=5, sticky=tk.W, padx=(5, 0))
         
         # 진행상황 표시
@@ -614,11 +614,18 @@ class WebCrawlerApp:
     def undo_url(self, event=None):
         """마지막 작업을 실행취소합니다."""
         try:
-            # macOS tkinter에서 edit_undo를 지원하지 않으므로 대체 기능
-            # 이전 상태로 되돌리기 대신 전체 선택 기능 제공
-            self.url_entry.select_range(0, tk.END)
+            # macOS/Linux에서는 edit_undo 지원하지 않음
+            if hasattr(self.url_entry, 'edit_undo'):
+                self.url_entry.edit_undo()
+            else:
+                # 대체 기능: 전체 선택
+                self.url_entry.select_range(0, tk.END)
         except (tk.TclError, AttributeError):
-            pass
+            # 오류 발생 시 전체 선택으로 대체
+            try:
+                self.url_entry.select_range(0, tk.END)
+            except:
+                pass
         return 'break'
     
     def show_context_menu(self, event):
