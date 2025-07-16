@@ -48,4 +48,22 @@ Thumbs.db
 *.xlsx
 *.xls
 *.csv
-logs/ 
+logs/
+
+# PyInstaller
+build/
+dist/
+*.spec.backup
+*.exe
+*.app
+*.dmg
+
+# Build artifacts
+*.pyc
+*.pyo
+*.pyd
+
+# Installer
+installer/
+*.tmp
+Setup.exe 
